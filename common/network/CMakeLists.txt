@@ -11,6 +11,7 @@ set(NETWORK_SOURCES
   jsonescape.c
   websocket.c
   websockify.c
+  ip_auth.c
 
   webudp/CRC32.cpp
   webudp/WuArena.cpp

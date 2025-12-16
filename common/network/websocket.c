@@ -39,6 +39,16 @@
 #include "jsonescape.h"
 #include <network/Blacklist.h>
 
+__attribute__((weak))
+int kasm_ip_auth_hook(ws_ctx_t *ws_ctx,
+                      const char *handshake,
+                      const char *origip,
+                      const char *ip,
+                      const char *url)
+{
+    (void)ws_ctx; (void)handshake; (void)origip; (void)ip; (void)url;
+    return 0; // default allow
+}
 /*
  * Global state
  *
@@ -1913,6 +1923,16 @@ ws_ctx_t *do_handshake(int sock, char * const ip) {
         weblog(401, wsthread_handler_id, 0, origip, ip, "-", 1, url, strlen(response));
         free_ws_ctx(ws_ctx);
         return NULL;
+    }
+
+    // Optional external hook: IP allowlist (weak symbol)
+    if (kasm_ip_auth_hook) {
+        if (kasm_ip_auth_hook(ws_ctx, handshake, origip, ip, url)) {
+            // Log the deny (body already sent by hook)
+            weblog(403, wsthread_handler_id, 0, origip, ip, "-", 1, url, 0);
+            free_ws_ctx(ws_ctx);
+            return NULL;
+        }
     }
 
     unsigned char owner = 0;
