@@ -60,6 +60,7 @@ typedef struct {
 
     char      user[USERNAME_LEN];
     char      ip[64];
+    char xreal_ip[64];
 } ws_ctx_t;
 
 struct wspass_t {
