@@ -71,6 +71,7 @@ void fatal(char *msg)
 }
 
 #define WS_MAX_BUF_SIZE 4096
+#define ENV_CLIENT_IP "USER_CLIENT_IP_ADDRESS"
 
 // 2022-05-18 19:51:26,810 [INFO] websocket 0: 71.62.44.0 172.12.15.5 - "GET /api/get_frame_stats?client=auto HTTP/1.1" 403 2
 static void weblog(const unsigned code, const unsigned websocket,
@@ -1872,6 +1873,23 @@ ws_ctx_t *do_handshake(int sock, char * const ip) {
         usleep(10);
     }
 
+    // Extract and store the proxy-provided real client IP from the HTTP handshake header `X-Real-IP`
+    ws_ctx->xreal_ip[0] = '\0';
+    const char *xr = strcasestr(handshake, "\r\nX-Real-IP:");
+    if (xr) {
+        xr += strlen("\r\nX-Real-IP:");
+        while (*xr == ' ' || *xr == '\t') xr++;
+
+        const char *end = xr;
+        while (*end && *end != '\r' && *end != '\n') end++;
+
+        size_t n = (size_t)(end - xr);
+        if (n >= sizeof(ws_ctx->xreal_ip)) n = sizeof(ws_ctx->xreal_ip) - 1;
+
+        memcpy(ws_ctx->xreal_ip, xr, n);
+        ws_ctx->xreal_ip[n] = '\0';
+    }
+
     // Proxied?
     char origip[64];
     memcpy(origip, ip, 64);
@@ -2085,8 +2103,77 @@ done:
     return ws_ctx;
 }
 
-void proxy_handler(ws_ctx_t *ws_ctx);
+static void ws_close_and_drop(ws_ctx_t *ws_ctx, uint16_t code, const char *reason)
+{
+    if (!ws_ctx) return;
 
+    // Try to send a proper WebSocket Close frame if HyBi (RFC6455)
+    if (ws_ctx->hybi > 0) {
+        uint8_t frame[256];
+        size_t rlen = (reason ? strlen(reason) : 0);
+        if (rlen > 123) rlen = 123; // keep it small
+
+        size_t payload_len = 2 + rlen; // 2 bytes for close code + reason
+        size_t hdr_len = 2;
+
+        frame[0] = 0x88; // FIN + Close opcode
+
+        if (payload_len <= 125) {
+            frame[1] = (uint8_t)payload_len;
+            hdr_len = 2;
+        } else {
+            // unlikely with our cap, but safe
+            frame[1] = 126;
+            frame[2] = (payload_len >> 8) & 0xFF;
+            frame[3] = payload_len & 0xFF;
+            hdr_len = 4;
+        }
+
+        frame[hdr_len + 0] = (code >> 8) & 0xFF;
+        frame[hdr_len + 1] = code & 0xFF;
+
+        if (rlen) memcpy(frame + hdr_len + 2, reason, rlen);
+
+        // Ignore send errors; we're closing anyway
+        ws_send(ws_ctx, frame, hdr_len + payload_len);
+    }
+    else if (ws_ctx->hixie) {
+        // Hixie close frame
+        const uint8_t hclose[2] = { 0xFF, 0x00 };
+        ws_send(ws_ctx, hclose, sizeof(hclose));
+    }
+
+    // Always drop the TCP connection
+    if (ws_ctx->sockfd) {
+        shutdown(ws_ctx->sockfd, SHUT_RDWR);
+        close(ws_ctx->sockfd);
+        ws_ctx->sockfd = 0; // prevent double-close in ws_socket_free()
+    }
+}
+// compare env vs x-real-ip
+static int ip_policy_check(ws_ctx_t *ws_ctx)
+{
+    const char *env = getenv(ENV_CLIENT_IP);
+    if (!env || !env[0]) {
+        handler_msg("auth: env not set -> allow (xreal=%s)\n",
+                    ws_ctx->xreal_ip[0] ? ws_ctx->xreal_ip : "(missing)");
+        return 1;
+    }
+
+    const char *xreal = ws_ctx->xreal_ip;
+    if (!xreal || !xreal[0] || strcmp(env, xreal) != 0) {
+        handler_msg("auth: env mismatch X-Real-IP -> deny (env=%s xreal=%s)\n",
+              env,
+              (xreal && xreal[0]) ? xreal : "(missing)");
+        ws_close_and_drop(ws_ctx, 1008, "IP not allowed");
+        return 0;
+    }
+
+    handler_msg("auth: allow (env match xreal=%s)\n", xreal);
+    return 1;
+}
+
+void proxy_handler(ws_ctx_t *ws_ctx);
 __thread unsigned wsthread_handler_id;
 
 void *subthread(void *ptr) {
@@ -2106,7 +2193,10 @@ void *subthread(void *ptr) {
 
     memcpy(ws_ctx->ip, pass->ip, sizeof(pass->ip));
 
-    proxy_handler(ws_ctx);
+    // if env no set or env = x-real-ip
+    if (ip_policy_check(ws_ctx)) {
+        proxy_handler(ws_ctx);   
+    }    
     if (pipe_error) {
         handler_emsg("Closing due to SIGPIPE\n");
     }
